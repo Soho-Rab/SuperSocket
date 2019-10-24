@@ -2,54 +2,147 @@
 using System.Buffers;
 using System.Threading.Tasks;
 using System.IO.Pipelines;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SuperSocket.ProtoBase;
-
+using System.Collections;
+using System.Threading.Tasks.Sources;
+using System.Threading;
 
 namespace SuperSocket.Channel
 {
-    public abstract class PipeChannel<TPackageInfo> : ChannelBase<TPackageInfo>, IChannel<TPackageInfo>, IChannel
+    public abstract partial class PipeChannel<TPackageInfo> : ChannelBase<TPackageInfo>, IChannel<TPackageInfo>, IChannel, IPipeChannel
         where TPackageInfo : class
     {
         private IPipelineFilter<TPackageInfo> _pipelineFilter;
 
-        protected Pipe Output { get; }
+        protected Pipe Out { get; }
+
+        Pipe IPipeChannel.Out
+        {
+            get { return Out; }
+        }
+
+        protected Pipe In { get; }
+
+        Pipe IPipeChannel.In
+        {
+            get { return In; }
+        }
 
         protected ILogger Logger { get; }
 
         protected ChannelOptions Options { get; }
 
-        protected PipeChannel(IPipelineFilter<TPackageInfo> pipelineFilter, ChannelOptions options, ILogger logger)
+        protected PipeChannel(IPipelineFilter<TPackageInfo> pipelineFilter, ChannelOptions options)
         {
             _pipelineFilter = pipelineFilter;
+            _packageTaskSource = new ManualResetValueTaskSourceCore<TPackageInfo>();
             Options = options;
-            Logger = logger;
-            Output = new Pipe();
+            Logger = options.Logger;
+            Out = options.Out ?? new Pipe();
+            In = options.In ?? new Pipe();
         }
 
-        public override async Task StartAsync()
+        public async override IAsyncEnumerable<TPackageInfo> RunAsync()
+        {
+            var readsTask = ProcessReads();
+            var sendsTask = ProcessSends();
+            
+            while (true)
+            {
+                var package = await ReceivePackage();
+
+                _packageTaskSource.Reset();
+
+                if (package == null)
+                {
+                    await HandleClosing(readsTask, sendsTask);
+                    yield break;
+                }
+
+                yield return package;
+            }
+        }
+
+        private async Task HandleClosing(Task readsTask, Task sendsTask)
         {
             try
             {
-                var readsTask = ProcessReads();
-                var sendsTask = ProcessSends();
-
                 await Task.WhenAll(readsTask, sendsTask);
-                OnClosed();
             }
             catch (Exception e)
             {
-                Logger.LogError(e, "Unhandled exception in the method PipeChannel.StartAsync.");
+                Logger.LogError(e, "Unhandled exception in the method PipeChannel.Run.");
+            }
+            finally
+            {
+                OnClosed();
             }
         }
+        protected virtual async Task FillPipeAsync(PipeWriter writer)
+        {
+            var options = Options;
 
-        protected abstract Task ProcessReads();
+            while (true)
+            {
+                try
+                {
+                    var bufferSize = options.ReceiveBufferSize;
+                    var maxPackageLength = options.MaxPackageLength;
+
+                    if (maxPackageLength > 0)
+                        bufferSize = Math.Min(bufferSize, maxPackageLength);
+
+                    var memory = writer.GetMemory(bufferSize);
+
+                    var bytesRead = await FillPipeWithDataAsync(memory);         
+
+                    if (bytesRead == 0)
+                    {
+                        break;
+                    }
+
+                    // Tell the PipeWriter how much was read
+                    writer.Advance(bytesRead);
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError(e, "Exception happened in ReceiveAsync");
+                    break;
+                }
+
+                // Make the data available to the PipeReader
+                var result = await writer.FlushAsync();
+
+                if (result.IsCompleted)
+                {
+                    break;
+                }
+            }
+
+            // Signal to the reader that we're done writing
+            writer.Complete();
+            Out.Writer.Complete();// TODO: should complete the output right now?
+        }
+
+        protected abstract ValueTask<int> FillPipeWithDataAsync(Memory<byte> memory);
+
+        protected virtual async Task ProcessReads()
+        {
+            var pipe = In;
+
+            Task writing = FillPipeAsync(pipe.Writer);
+            Task reading = ReadPipeAsync(pipe.Reader);
+
+            await Task.WhenAll(reading, writing);
+        }
 
         protected async Task ProcessSends()
         {
-            var output = Output.Reader;
+            var output = Out.Reader;
 
             while (true)
             {
@@ -93,14 +186,14 @@ namespace SuperSocket.Channel
 
         public override async ValueTask SendAsync(ReadOnlyMemory<byte> buffer)
         {
-            var writer = Output.Writer;
+            var writer = Out.Writer;
             await writer.WriteAsync(buffer);
             await writer.FlushAsync();
         }
 
         public override async ValueTask SendAsync<TPackage>(IPackageEncoder<TPackage> packageEncoder, TPackage package)
         {
-            var writer = Output.Writer;
+            var writer = Out.Writer;
             packageEncoder.Encode(writer, package);
             await writer.FlushAsync();
         }
@@ -133,30 +226,13 @@ namespace SuperSocket.Channel
 
                     var completed = result.IsCompleted;
 
-                    while (true)
+                    if (buffer.Length > 0)
                     {
-                        var package = ReaderBuffer(buffer, out consumed, out examined);
-
-                        if (package != null)
+                        if (!ReaderBuffer(buffer, out consumed, out examined))
                         {
-                            await OnPackageReceived(package);
-                        }
-
-                        var maxPackageLength = Options.MaxPackageLength;
-
-                        if (maxPackageLength > 0 && buffer.Length > maxPackageLength)
-                        {
-                            Logger.LogError($"Package cannot be larger than {maxPackageLength}.");
                             completed = true;
-                            // close the the connection directly
-                            Close();
                             break;
-                        }
-
-                        if (examined.Equals(buffer.End))
-                            break;
-
-                        buffer = buffer.Slice(examined);
+                        }                        
                     }
 
                     if (completed)
@@ -171,35 +247,57 @@ namespace SuperSocket.Channel
             reader.Complete();
         }
 
-        private TPackageInfo ReaderBuffer(ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
+        private bool ReaderBuffer(ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
         {
             consumed = buffer.Start;
             examined = buffer.End;
 
+            var maxPackageLength = Options.MaxPackageLength;
+
             var seqReader = new SequenceReader<byte>(buffer);
-            var currentPipelineFilter = _pipelineFilter;
 
-            var packageInfo = currentPipelineFilter.Filter(ref seqReader);
-
-            if (currentPipelineFilter.NextFilter != null)
-                _pipelineFilter = currentPipelineFilter.NextFilter;
-        
-            // continue receive...
-            if (packageInfo == null)
-                return null;
-
-            currentPipelineFilter.Reset();
-
-            if (seqReader.End) // no more data
+            while (true)
             {
-                consumed = buffer.End;
-            }
-            else
-            {
-                examined = consumed = seqReader.Position;
+                var currentPipelineFilter = _pipelineFilter;
+
+                var packageInfo = currentPipelineFilter.Filter(ref seqReader);
+
+                if (currentPipelineFilter.NextFilter != null)
+                    _pipelineFilter = currentPipelineFilter.NextFilter;
+
+                var pos = seqReader.Position.GetInteger();
+
+                if (maxPackageLength > 0 && pos > maxPackageLength)
+                {
+                    Logger.LogError($"Package cannot be larger than {maxPackageLength}.");
+                    // close the the connection directly
+                    Close();
+                    _packageTaskSource.SetResult(null);
+                    return false;
+                }
+            
+                // continue receive...
+                if (packageInfo == null)
+                {
+                    return true;
+                }
+
+                currentPipelineFilter.Reset();
+
+                _packageTaskSource.SetResult(packageInfo);
+
+                if (seqReader.End) // no more data
+                {
+                    consumed = buffer.End;
+                    break;
+                }
+                else
+                {
+                    examined = consumed = seqReader.Position;
+                }
             }
 
-            return packageInfo;
+            return true;
         }
     }
 }
