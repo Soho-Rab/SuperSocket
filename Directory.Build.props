@@ -1,10 +1,16 @@
 <Project>
   <Import Project="Dependencies.props" />
   <PropertyGroup>
-    <Version>2.0.0-preview1-3</Version>
+    <Version>2.0.0-preview2-04</Version>
     <LangVersion>8.0</LangVersion>    
     <LibTargetFramework>netstandard2.1</LibTargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>    
     <PackageProjectUrl>https://github.com/kerryjiang/supersocket</PackageProjectUrl>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IncludeSource>true</IncludeSource>
+    <Authors>Kerry Jiang</Authors>
   </PropertyGroup>
 </Project>

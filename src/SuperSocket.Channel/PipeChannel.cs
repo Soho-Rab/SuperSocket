@@ -4,13 +4,12 @@ using System.Threading.Tasks;
 using System.IO.Pipelines;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using SuperSocket.ProtoBase;
-using System.Collections;
-using System.Threading.Tasks.Sources;
-using System.Threading;
 
+
+[assembly: InternalsVisibleTo("Test")] 
 namespace SuperSocket.Channel
 {
     public abstract partial class PipeChannel<TPackageInfo> : ChannelBase<TPackageInfo>, IChannel<TPackageInfo>, IChannel, IPipeChannel
@@ -32,6 +31,13 @@ namespace SuperSocket.Channel
             get { return In; }
         }
 
+        IPipelineFilter IPipeChannel.PipelineFilter
+        {
+            get { return _pipelineFilter; }
+        }
+
+        private IObjectPipe<TPackageInfo> _packagePipe;
+
         protected ILogger Logger { get; }
 
         protected ChannelOptions Options { get; }
@@ -39,7 +45,7 @@ namespace SuperSocket.Channel
         protected PipeChannel(IPipelineFilter<TPackageInfo> pipelineFilter, ChannelOptions options)
         {
             _pipelineFilter = pipelineFilter;
-            _packageTaskSource = new ManualResetValueTaskSourceCore<TPackageInfo>();
+            _packagePipe = new DefaultObjectPipe<TPackageInfo>();
             Options = options;
             Logger = options.Logger;
             Out = options.Out ?? new Pipe();
@@ -53,9 +59,7 @@ namespace SuperSocket.Channel
             
             while (true)
             {
-                var package = await ReceivePackage();
-
-                _packageTaskSource.Reset();
+                var package = await _packagePipe.ReadAsync();
 
                 if (package == null)
                 {
@@ -105,12 +109,16 @@ namespace SuperSocket.Channel
                         break;
                     }
 
+                    LastActiveTime = DateTimeOffset.Now;
+                    
                     // Tell the PipeWriter how much was read
                     writer.Advance(bytesRead);
                 }
                 catch (Exception e)
                 {
-                    Logger.LogError(e, "Exception happened in ReceiveAsync");
+                    if (!IsIgnorableException(e))
+                        Logger.LogError(e, "Exception happened in ReceiveAsync");
+                    
                     break;
                 }
 
@@ -126,6 +134,11 @@ namespace SuperSocket.Channel
             // Signal to the reader that we're done writing
             writer.Complete();
             Out.Writer.Complete();// TODO: should complete the output right now?
+        }
+
+        protected virtual bool IsIgnorableException(Exception e)
+        {
+            return false;
         }
 
         protected abstract ValueTask<int> FillPipeWithDataAsync(Memory<byte> memory);
@@ -160,7 +173,8 @@ namespace SuperSocket.Channel
                 {
                     try
                     {
-                        await SendAsync(buffer);
+                        await SendOverIOAsync(buffer);
+                        LastActiveTime = DateTimeOffset.Now;
                     }
                     catch (Exception e)
                     {
@@ -181,21 +195,55 @@ namespace SuperSocket.Channel
             output.Complete();
         }
 
-        protected abstract ValueTask<int> SendAsync(ReadOnlySequence<byte> buffer);
+
+        private void CheckChannelOpen()
+        {
+            if (this.IsClosed)
+            {
+                throw new Exception("Channel is closed now, send is not allowed.");
+            }
+        }
+
+        protected abstract ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer);
 
 
         public override async ValueTask SendAsync(ReadOnlyMemory<byte> buffer)
         {
             var writer = Out.Writer;
-            await writer.WriteAsync(buffer);
+            WriteBuffer(writer, buffer);
             await writer.FlushAsync();
+        }
+
+        private void WriteBuffer(PipeWriter writer, ReadOnlyMemory<byte> buffer)
+        {
+            lock (writer)
+            {
+                CheckChannelOpen();
+                writer.Write(buffer.Span);
+            }
         }
 
         public override async ValueTask SendAsync<TPackage>(IPackageEncoder<TPackage> packageEncoder, TPackage package)
         {
             var writer = Out.Writer;
-            packageEncoder.Encode(writer, package);
+            WritePackageWithEncoder<TPackage>(writer, packageEncoder, package);
             await writer.FlushAsync();
+        }
+
+        public override async ValueTask SendAsync(Action<PipeWriter> write)
+        {
+            var writer = Out.Writer;
+            write(writer);
+            await writer.FlushAsync();
+        }
+
+        private void WritePackageWithEncoder<TPackage>(PipeWriter writer, IPackageEncoder<TPackage> packageEncoder, TPackage package)
+        {
+            lock (writer)
+            {
+                CheckChannelOpen();
+                packageEncoder.Encode(writer, package);
+            }
         }
 
         protected internal ArraySegment<T> GetArrayByMemory<T>(ReadOnlyMemory<T> memory)
@@ -222,13 +270,16 @@ namespace SuperSocket.Channel
                 try
                 {
                     if (result.IsCanceled)
+                    {
+                        WriteEOFPackage();
                         break;
+                    }
 
                     var completed = result.IsCompleted;
 
                     if (buffer.Length > 0)
                     {
-                        if (!ReaderBuffer(buffer, out consumed, out examined))
+                        if (!ReaderBuffer(ref buffer, out consumed, out examined))
                         {
                             completed = true;
                             break;
@@ -236,7 +287,18 @@ namespace SuperSocket.Channel
                     }
 
                     if (completed)
+                    {
+                        WriteEOFPackage();
                         break;
+                    }
+                }
+                catch (Exception e)
+                {
+                    Logger.LogCritical(e, "Protocol error");
+                    // close the connection if get a protocol error
+                    Close();
+                    WriteEOFPackage();
+                    break;
                 }
                 finally
                 {
@@ -247,10 +309,17 @@ namespace SuperSocket.Channel
             reader.Complete();
         }
 
-        private bool ReaderBuffer(ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
+        private void WriteEOFPackage()
+        {
+            _packagePipe.Write(null);
+        }
+
+        private bool ReaderBuffer(ref ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
         {
             consumed = buffer.Start;
             examined = buffer.End;
+
+            var bytesConsumedTotal = 0L;
 
             var maxPackageLength = Options.MaxPackageLength;
 
@@ -262,42 +331,50 @@ namespace SuperSocket.Channel
 
                 var packageInfo = currentPipelineFilter.Filter(ref seqReader);
 
-                if (currentPipelineFilter.NextFilter != null)
-                    _pipelineFilter = currentPipelineFilter.NextFilter;
+                var nextFilter = currentPipelineFilter.NextFilter;
 
-                var pos = seqReader.Position.GetInteger();
+                if (nextFilter != null)
+                {
+                    nextFilter.Context = currentPipelineFilter.Context; // pass through the context
+                    _pipelineFilter = nextFilter;
+                }
 
-                if (maxPackageLength > 0 && pos > maxPackageLength)
+                var bytesConsumed = seqReader.Consumed;
+                bytesConsumedTotal += bytesConsumed;
+
+                var len = bytesConsumed;
+
+                // nothing has been consumed, need more data
+                if (len == 0)
+                    len = seqReader.Length;
+
+                if (maxPackageLength > 0 && len > maxPackageLength)
                 {
                     Logger.LogError($"Package cannot be larger than {maxPackageLength}.");
                     // close the the connection directly
                     Close();
-                    _packageTaskSource.SetResult(null);
                     return false;
                 }
             
                 // continue receive...
                 if (packageInfo == null)
                 {
+                    consumed = buffer.GetPosition(bytesConsumedTotal);
                     return true;
                 }
 
                 currentPipelineFilter.Reset();
 
-                _packageTaskSource.SetResult(packageInfo);
+                _packagePipe.Write(packageInfo);
 
                 if (seqReader.End) // no more data
                 {
-                    consumed = buffer.End;
-                    break;
+                    examined = consumed = buffer.End;
+                    return true;
                 }
-                else
-                {
-                    examined = consumed = seqReader.Position;
-                }
+                
+                seqReader = new SequenceReader<byte>(seqReader.Sequence.Slice(bytesConsumed));
             }
-
-            return true;
         }
     }
 }

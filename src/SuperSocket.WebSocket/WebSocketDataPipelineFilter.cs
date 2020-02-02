@@ -5,41 +5,26 @@ using SuperSocket.WebSocket.FramePartReader;
 
 namespace SuperSocket.WebSocket
 {
-    public class WebSocketDataPipelineFilter : IPipelineFilter<WebSocketPackage>
+    public class WebSocketDataPipelineFilter : PackagePartsPipelineFilter<WebSocketPackage>
     {
-        public IPackageDecoder<WebSocketPackage> Decoder { get; set; } 
-               
-
-        public IPipelineFilter<WebSocketPackage> NextFilter => null;
-
-        private IDataFramePartReader _currentPartReader;
-
-        private WebSocketPackage _currentPackage;
-
-        public WebSocketPackage Filter(ref SequenceReader<byte> reader)
+        private HttpHeader _httpHeader;
+        
+        public WebSocketDataPipelineFilter(HttpHeader httpHeader)
         {
-            var package = _currentPackage;
-
-            if (package == null)
-            {
-                _currentPackage = package = new WebSocketPackage();
-                _currentPartReader = DataFramePartReader.NewReader;
-            }
-
-            if (!_currentPartReader.Process(package, ref reader, out IDataFramePartReader nextPartReader))
-            {
-                _currentPartReader = nextPartReader;
-                return null;
-            }
-
-            Reset();
-            return package;
+            _httpHeader = httpHeader;
         }
 
-        public void Reset()
+        protected override WebSocketPackage CreatePackage()
         {
-            _currentPackage = null;
-            _currentPartReader = null;
+            return new WebSocketPackage
+            {
+                HttpHeader = _httpHeader
+            };
+        }
+
+        protected override IPackagePartReader<WebSocketPackage> GetFirstPartReader()
+        {
+            return PackagePartReader.NewReader;
         }
     }
 }

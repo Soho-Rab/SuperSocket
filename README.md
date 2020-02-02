@@ -26,20 +26,16 @@
     - Basic pipeline filters
     - Commands
     - Session container
-    - First beta release
+    - First preview
 
 - 2019 Q3-Q4:
     - Fix issues and do enhancements for the existing features
     - Features requested by users
     - TLS Socket
     - Performance test/tuning
-    - Second beta release
+    - Second preview
 
 - 2020 H1:
     - Fix issues of the existing features
     - Other features requested by users
     - Stable release
-
----
-
-*Copyright 2010-2019 Kerry Jiang (kerry-jiang@hotmail.com)*

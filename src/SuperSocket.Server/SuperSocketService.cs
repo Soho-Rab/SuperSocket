@@ -13,7 +13,7 @@ using SuperSocket.ProtoBase;
 
 namespace SuperSocket.Server
 {
-    public class SuperSocketService<TReceivePackageInfo> : IHostedService, IServer, IChannelRegister
+    public class SuperSocketService<TReceivePackageInfo> : IHostedService, IServer, IChannelRegister, ILoggerAccessor
         where TReceivePackageInfo : class
     {
         private readonly IServiceProvider _serviceProvider;
@@ -27,11 +27,22 @@ namespace SuperSocket.Server
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger _logger;
 
+        internal protected ILogger Logger
+        {
+            get { return _logger; }
+        }
+
+        ILogger ILoggerAccessor.Logger
+        {
+            get { return _logger; }
+        }
+
         private IPipelineFilterFactory<TReceivePackageInfo> _pipelineFilterFactory;
         private IChannelCreatorFactory _channelCreatorFactory;
         private List<IChannelCreator> _channelCreators;
         private IPackageHandler<TReceivePackageInfo> _packageHandler;
-
+        private Func<IAppSession, PackageHandlingException<TReceivePackageInfo>, ValueTask<bool>> _errorHandler;
+        
         public string Name { get; }
 
         private int _sessionCount;
@@ -49,6 +60,10 @@ namespace SuperSocket.Server
             get { return _state; }
         }
 
+        public object DataContext { get; set; }
+
+        private SessionHandlers _sessionHandlers;
+
         public SuperSocketService(IServiceProvider serviceProvider, IOptions<ServerOptions> serverOptions, ILoggerFactory loggerFactory, IChannelCreatorFactory channelCreatorFactory)
         {
             _serverOptions = serverOptions;
@@ -60,7 +75,14 @@ namespace SuperSocket.Server
             _logger = _loggerFactory.CreateLogger("SuperSocketService");
             _channelCreatorFactory = channelCreatorFactory;
             _packageHandler = serviceProvider.GetService<IPackageHandler<TReceivePackageInfo>>();
+            _errorHandler = serviceProvider.GetService<Func<IAppSession, PackageHandlingException<TReceivePackageInfo>, ValueTask<bool>>>();
+            _sessionHandlers = serviceProvider.GetService<SessionHandlers>();
 
+            if (_errorHandler == null)
+            {
+                _errorHandler = OnSessionErrorAsync;
+            }
+            
             // initialize session factory
             _sessionFactory = serviceProvider.GetService<ISessionFactory>();
 
@@ -73,10 +95,32 @@ namespace SuperSocket.Server
 
         private void InitializeMiddlewares()
         {
-            _middlewares = _serviceProvider.GetServices<IMiddleware>().ToArray();
+            _middlewares = _serviceProvider.GetServices<IMiddleware>()
+                .OrderBy(m => m.Order)
+                .ToArray();
+
+            foreach (var m in _middlewares)
+            {
+                m.Start(this);
+            }
 
             if (_packageHandler == null)
                 _packageHandler = _middlewares.OfType<IPackageHandler<TReceivePackageInfo>>().FirstOrDefault();
+        }
+
+        private void ShutdownMiddlewares()
+        {
+            foreach (var m in _middlewares)
+            {
+                try
+                {
+                    m.Shutdown(this);
+                }
+                catch(Exception e)
+                {
+                    _logger.LogError(e, $"The exception was thrown from the middleware {m.GetType().Name} when it is being shutdown.");
+                }                
+            }
         }
 
         protected virtual IPipelineFilterFactory<TReceivePackageInfo> GetPipelineFilterFactory()
@@ -95,6 +139,7 @@ namespace SuperSocket.Server
                 return false;
             }
 
+            _logger.LogInformation($"The listener [{listener}] has been started.");
             _channelCreators.Add(listener);
             return true;
         }
@@ -141,19 +186,28 @@ namespace SuperSocket.Server
         private void AcceptNewChannel(IChannel channel)
         {
             var session = _sessionFactory.Create() as AppSession;
-            InitializeSession(session, channel);
-            HandleSession(session).DoNotAwait();
+            HandleSession(session, channel).DoNotAwait();
         }
 
-        void IChannelRegister.RegisterChannel(object connection)
+        async Task IChannelRegister.RegisterChannel(object connection)
         {
-            var channel = _channelCreators.FirstOrDefault().CreateChannel(connection);
+            var channel = await _channelCreators.FirstOrDefault().CreateChannel(connection);
             AcceptNewChannel(channel);
         }
 
-        private void InitializeSession(IAppSession session, IChannel channel)
+        protected virtual object CreatePipelineContext(IAppSession session)
+        {
+            return session;
+        }
+
+        private async ValueTask<bool> InitializeSession(IAppSession session, IChannel channel)
         {
             session.Initialize(this, channel);
+
+            if (channel is IPipeChannel pipeChannel)
+            {
+                pipeChannel.PipelineFilter.Context = CreatePipelineContext(session);
+            }
 
             var middlewares = _middlewares;
 
@@ -161,42 +215,114 @@ namespace SuperSocket.Server
             {
                 for (var i = 0; i < middlewares.Length; i++)
                 {
-                    middlewares[i].Register(this, session);
+                    var middleware = middlewares[i];
+
+                    if (!await middleware.RegisterSession(session))
+                    {
+                        _logger.LogWarning($"A session from {session.RemoteEndPoint} was rejected by the middleware {middleware.GetType().Name}.");
+                        return false;
+                    }
                 }
             }
+
+            return true;
         }
 
-        private async Task HandleSession(AppSession session)
+
+        protected virtual ValueTask OnSessionConnectedAsync(IAppSession session)
         {
-            Interlocked.Increment(ref _sessionCount);
+            var connectedHandler = _sessionHandlers?.Connected;
+
+            if (connectedHandler != null)
+                return connectedHandler.Invoke(session);
+
+            return new ValueTask();
+        }
+
+        protected virtual ValueTask OnSessionClosedAsync(IAppSession session)
+        {
+            var closedHandler = _sessionHandlers?.Closed;
+
+            if (closedHandler != null)
+                return closedHandler.Invoke(session);
+
+            return new ValueTask();
+        }
+
+        protected virtual async ValueTask FireSessionConnectedEvent(AppSession session)
+        {
+            _logger.LogInformation($"A new session connected: {session.SessionID}");
 
             try
             {
-                _logger.LogInformation($"A new session connected: {session.SessionID}");
+                Interlocked.Increment(ref _sessionCount);
                 session.OnSessionConnected();
+                await OnSessionConnectedAsync(session);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "There is one exception thrown from the event handler of SessionConnected.");
+            }
+        }
 
-                var channel = session.Channel as IChannel<TReceivePackageInfo>;
+        protected virtual async ValueTask FireSessionClosedEvent(AppSession session)
+        {
+            _logger.LogInformation($"The session disconnected: {session.SessionID}");
 
-                await foreach (var p in channel.RunAsync())
+            try
+            {
+                Interlocked.Decrement(ref _sessionCount);
+                session.OnSessionClosed(EventArgs.Empty);
+                await OnSessionClosedAsync(session); 
+            }
+            catch (Exception exc)
+            {
+                _logger.LogError(exc, "There is one exception thrown from the event of OnSessionClosed.");
+            }
+        }
+
+        private async ValueTask HandleSession(AppSession session, IChannel channel)
+        {
+            if (!await InitializeSession(session, channel))
+                return;
+
+            try
+            {
+                await FireSessionConnectedEvent(session);
+
+                var packageChannel = channel as IChannel<TReceivePackageInfo>;
+
+                await foreach (var p in packageChannel.RunAsync())
                 {
-                    await _packageHandler?.Handle(session, p);
+                    try
+                    {
+                        await _packageHandler?.Handle(session, p);
+                    }
+                    catch (Exception e)
+                    {
+                        var toClose = await _errorHandler(session, new PackageHandlingException<TReceivePackageInfo>($"Session {session.SessionID} got an error when handle a package.", p, e));
+
+                        if (toClose)
+                        {
+                            session.Close();
+                        }
+                    }                    
                 }
-
-                _logger.LogInformation($"The session disconnected: {session.SessionID}");
-
-                session.OnSessionClosed(EventArgs.Empty);                
             }
             catch (Exception e)
             {
                 _logger.LogError($"Failed to handle the session {session.SessionID}.", e);
             }
-
-            Interlocked.Decrement(ref _sessionCount);
+            finally
+            {
+                await FireSessionClosedEvent(session);
+            }
         }
 
-        protected virtual void OnSessionError(IAppSession session, Exception exception)
+        protected virtual ValueTask<bool> OnSessionErrorAsync(IAppSession session, PackageHandlingException<TReceivePackageInfo> exception)
         {
             _logger.LogError($"Session[{session.SessionID}]: session exception.", exception);
+            return new ValueTask<bool>(true);
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -213,6 +339,31 @@ namespace SuperSocket.Server
             await StartListenAsync(cancellationToken);
 
             _state = ServerState.Started;
+
+            try
+            {
+                await OnStartedAsync();
+            }
+            catch(Exception e)
+            {
+                _logger.LogError(e, "There is one exception thrown from the method OnStartedAsync().");
+            }
+        }
+
+        protected virtual ValueTask OnStartedAsync()
+        {
+            return new ValueTask();
+        }
+
+        protected virtual ValueTask OnStopAsync()
+        {
+            return new ValueTask();
+        }
+
+        private async Task StopListener(IChannelCreator listener)
+        {
+            await listener.StopAsync();
+            _logger.LogInformation($"The listener [{listener}] has been stopped.");
         }
 
         public async Task StopAsync(CancellationToken cancellationToken)
@@ -226,8 +377,19 @@ namespace SuperSocket.Server
 
             _state = ServerState.Stopping;
 
-            var tasks = _channelCreators.Where(l => l.IsRunning).Select(l => l.StopAsync()).ToArray();
+            var tasks = _channelCreators.Where(l => l.IsRunning).Select(l => StopListener(l))
+                .Union(new Task[] { Task.Run(ShutdownMiddlewares) });
+
             await Task.WhenAll(tasks);
+
+            try
+            {
+                await OnStopAsync();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "There is an exception thrown from the method OnStopAsync().");
+            }
 
             _state = ServerState.Stopped;
         }
@@ -256,13 +418,14 @@ namespace SuperSocket.Server
                 {
                     try
                     {
-                        if (_state != ServerState.Started)
+                        if (_state == ServerState.Started)
                         {
                             await StopAsync(CancellationToken.None);
                         }
                     }
-                    catch
+                    catch (Exception e)
                     {
+                        _logger.LogError(e, "Failed to stop the server");
                     }
                 }
 

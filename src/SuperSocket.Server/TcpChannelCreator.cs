@@ -5,6 +5,7 @@ using System.Threading;
 using System.Net;
 using SuperSocket.Channel;
 using Microsoft.Extensions.Logging;
+using System.Security.Authentication;
 
 namespace SuperSocket.Server
 {
@@ -14,11 +15,11 @@ namespace SuperSocket.Server
 
         private CancellationTokenSource _cancellationTokenSource;
         private TaskCompletionSource<bool> _stopTaskCompletionSource;
-        private readonly Func<Socket, IChannel> _channelFactory;
+        private readonly Func<Socket, Task<IChannel>> _channelFactory;
         public ListenOptions Options { get; }
         private ILogger _logger;
 
-        public TcpChannelCreator(ListenOptions options, Func<Socket, IChannel> channelFactory, ILogger logger)
+        public TcpChannelCreator(ListenOptions options, Func<Socket, Task<IChannel>> channelFactory, ILogger logger)
         {
             Options = options;
             _channelFactory = channelFactory;
@@ -53,6 +54,11 @@ namespace SuperSocket.Server
 
             try
             {
+                if (options.Security != SslProtocols.None && options.CertificateOptions != null)
+                {
+                    options.CertificateOptions.EnsureCertificate();
+                }
+
                 var listenEndpoint = GetListenEndPoint(options.Ip, options.Port);
                 var listenSocket = _listenSocket = new Socket(listenEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
                 
@@ -86,7 +92,7 @@ namespace SuperSocket.Server
                 try
                 {
                     var client = await listenSocket.AcceptAsync();
-                    OnNewClientAccept(client);
+                    await OnNewClientAccept(client);
                 }
                 catch (Exception)
                 {
@@ -99,16 +105,31 @@ namespace SuperSocket.Server
 
         public event NewClientAcceptHandler NewClientAccepted;
 
-        private void OnNewClientAccept(Socket socket)
+        private async Task OnNewClientAccept(Socket socket)
         {
             var handler = NewClientAccepted;
 
-            handler?.Invoke(this, _channelFactory(socket));
+            if (handler == null)
+                return;
+
+            IChannel channel = null;
+
+            try
+            {
+                channel = await _channelFactory(socket);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, $"Failed to create channel for {socket.RemoteEndPoint}.");
+                return;
+            }            
+
+            handler.Invoke(this, channel);
         }
 
-        public IChannel CreateChannel(object connection)
+        public async Task<IChannel> CreateChannel(object connection)
         {
-            return _channelFactory((Socket)connection);
+            return await _channelFactory((Socket)connection);
         }
 
         public Task StopAsync()

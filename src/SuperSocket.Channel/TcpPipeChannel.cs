@@ -23,6 +23,8 @@ namespace SuperSocket.Channel
             : base(pipelineFilter, options)
         {
             _socket = socket;
+            RemoteEndPoint = socket.RemoteEndPoint;
+            LocalEndPoint = socket.LocalEndPoint;
         }
 
         protected override void OnClosed()
@@ -41,7 +43,7 @@ namespace SuperSocket.Channel
             return await socket.ReceiveAsync(GetArrayByMemory((ReadOnlyMemory<byte>)memory), socketFlags);
         }
 
-        protected override async ValueTask<int> SendAsync(ReadOnlySequence<byte> buffer)
+        protected override async ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer)
         {
             if (buffer.IsSingleSegment)
             {
@@ -85,6 +87,17 @@ namespace SuperSocket.Channel
                     socket.Close();
                 }
             }
+        }
+
+        protected override bool IsIgnorableException(Exception e)
+        {
+            if (e is SocketException se)
+            {
+                if (se.IsIgnorableSocketException())
+                    return true;
+            }
+
+            return false;
         }
     }
 }

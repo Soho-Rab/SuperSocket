@@ -28,14 +28,22 @@ namespace SuperSocket.Channel
             Out.Writer.Complete();
         }
 
-        protected override async ValueTask<int> SendAsync(ReadOnlySequence<byte> buffer)
+        protected override async ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer)
         {
-            foreach (var piece in buffer)
+            var writer = Out.Writer;
+            var total = 0;
+
+            foreach (var data in buffer)
             {
-                await Out.Writer.WriteAsync(piece);
+                var result = await writer.WriteAsync(data);
+
+                if (result.IsCompleted)
+                    total += data.Length;
+                else if (result.IsCanceled)
+                    break;
             }
-            
-            return (int)buffer.Length;
+
+            return total;
         }
 
         protected override ValueTask<int> FillPipeWithDataAsync(Memory<byte> memory)

@@ -9,7 +9,7 @@ using Xunit.Abstractions;
 
 namespace Tests
 {
-    [Collection("Protocol.Terminator")]
+    [Trait("Category", "Protocol.Terminator")]
     public class TerminatorProtocolTest : ProtocolTestBase
     {
         public TerminatorProtocolTest(ITestOutputHelper outputHelper) : base(outputHelper)
@@ -22,9 +22,9 @@ namespace Tests
             return $"{sourceLine}##";
         }
 
-        protected override IServer CreateServer()
+        protected override IServer CreateServer(IHostConfigurator hostConfigurator)
         {
-            var server = CreateSocketServerBuilder<TextPackageInfo>((x) => new TerminatorTextPipelineFilter(new[] { (byte)'#', (byte)'#' }))
+            var server = CreateSocketServerBuilder<TextPackageInfo>((x) => new TerminatorTextPipelineFilter(new[] { (byte)'#', (byte)'#' }), hostConfigurator)
                 .ConfigurePackageHandler(async (s, p) =>
                 {
                     await s.SendAsync(Utf8Encoding.GetBytes(p.Text + "\r\n"));

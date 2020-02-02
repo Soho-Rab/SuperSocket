@@ -14,13 +14,15 @@ namespace SuperSocket.SessionContainer
 
         public InProcSessionContainerMiddleware(IServiceProvider serviceProvider)
         {
+            Order = int.MaxValue; // make sure it is the last middleware
             _sessions = new ConcurrentDictionary<string, IAppSession>(StringComparer.OrdinalIgnoreCase);
         }
 
-        public override void Register(IServer server, IAppSession session)
+        public override ValueTask<bool> RegisterSession(IAppSession session)
         {
             session.Closed += OnSessionClosed;
             _sessions.TryAdd(session.SessionID, session);
+            return new ValueTask<bool>(true);
         }
 
         private void OnSessionClosed(object sender, EventArgs e)
@@ -40,6 +42,33 @@ namespace SuperSocket.SessionContainer
         public int GetSessionCount()
         {
             return _sessions.Count;
+        }
+
+        public IEnumerable<IAppSession> GetSessions(Predicate<IAppSession> critera = null)
+        {
+            var enumerator = _sessions.GetEnumerator();
+
+            while (enumerator.MoveNext())
+            {
+                var s = enumerator.Current.Value;
+
+                if(critera == null || critera(s))
+                    yield return s;
+            }
+        }
+
+        public IEnumerable<TAppSession> GetSessions<TAppSession>(Predicate<TAppSession> critera = null) where TAppSession : IAppSession
+        {
+            var enumerator = _sessions.GetEnumerator();
+
+            while (enumerator.MoveNext())
+            {
+                if (enumerator.Current.Value is TAppSession s)
+                {
+                    if (critera == null || critera(s))
+                        yield return s;
+                }
+            }
         }
     }
 }
