@@ -20,17 +20,25 @@ namespace SuperSocket.SessionContainer
 
         public override ValueTask<bool> RegisterSession(IAppSession session)
         {
+            if (session is IHandshakeRequiredSession handshakeSession)
+            {
+                if (!handshakeSession.Handshaked)
+                    return new ValueTask<bool>(true);
+            }
+            
             session.Closed += OnSessionClosed;
             _sessions.TryAdd(session.SessionID, session);
             return new ValueTask<bool>(true);
         }
 
-        private void OnSessionClosed(object sender, EventArgs e)
+        private ValueTask OnSessionClosed(object sender, EventArgs e)
         {
             var session  = (IAppSession)sender;
 
             session.Closed -= OnSessionClosed;
             _sessions.TryRemove(session.SessionID, out IAppSession removedSession);
+            
+            return new ValueTask();
         }
 
         public IAppSession GetSessionByID(string sessionID)
@@ -52,6 +60,9 @@ namespace SuperSocket.SessionContainer
             {
                 var s = enumerator.Current.Value;
 
+                if (s.State != SessionState.Connected)
+                    continue;
+
                 if(critera == null || critera(s))
                     yield return s;
             }
@@ -65,6 +76,9 @@ namespace SuperSocket.SessionContainer
             {
                 if (enumerator.Current.Value is TAppSession s)
                 {
+                    if (s.State != SessionState.Connected)
+                        continue;
+                        
                     if (critera == null || critera(s))
                         yield return s;
                 }

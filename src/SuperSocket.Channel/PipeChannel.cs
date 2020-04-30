@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers;
+using System.Threading;
 using System.Threading.Tasks;
 using System.IO.Pipelines;
 using System.Collections.Generic;
@@ -16,6 +17,10 @@ namespace SuperSocket.Channel
         where TPackageInfo : class
     {
         private IPipelineFilter<TPackageInfo> _pipelineFilter;
+
+        private CancellationTokenSource _cts = new CancellationTokenSource();
+
+        private SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
         protected Pipe Out { get; }
 
@@ -42,6 +47,12 @@ namespace SuperSocket.Channel
 
         protected ChannelOptions Options { get; }
 
+        private Task _readsTask;
+
+        private Task _sendsTask;
+
+        private bool _isDetaching = false;
+
         protected PipeChannel(IPipelineFilter<TPackageInfo> pipelineFilter, ChannelOptions options)
         {
             _pipelineFilter = pipelineFilter;
@@ -52,18 +63,27 @@ namespace SuperSocket.Channel
             In = options.In ?? new Pipe();
         }
 
-        public async override IAsyncEnumerable<TPackageInfo> RunAsync()
+        protected void StartTasks()
         {
-            var readsTask = ProcessReads();
-            var sendsTask = ProcessSends();
-            
+            _readsTask = ProcessReads();
+            _sendsTask = ProcessSends();
+            WaitHandleClosing();
+        }
+
+        private async void WaitHandleClosing()
+        {
+            await HandleClosing();
+        }
+
+        public async override IAsyncEnumerable<TPackageInfo> RunAsync()
+        { 
             while (true)
             {
                 var package = await _packagePipe.ReadAsync();
 
                 if (package == null)
                 {
-                    await HandleClosing(readsTask, sendsTask);
+                    await HandleClosing();
                     yield break;
                 }
 
@@ -71,26 +91,40 @@ namespace SuperSocket.Channel
             }
         }
 
-        private async Task HandleClosing(Task readsTask, Task sendsTask)
+        private async ValueTask HandleClosing()
         {
             try
             {
-                await Task.WhenAll(readsTask, sendsTask);
+                await Task.WhenAll(_readsTask, _sendsTask);
+            }
+            catch (OperationCanceledException)
+            {
             }
             catch (Exception e)
             {
-                Logger.LogError(e, "Unhandled exception in the method PipeChannel.Run.");
+                OnError("Unhandled exception in the method PipeChannel.Run.", e);
             }
             finally
             {
-                OnClosed();
+                if (!_isDetaching)
+                    OnClosed();
             }
         }
+
+        protected abstract void Close();
+
+        public override async ValueTask CloseAsync()
+        {
+            Close();
+            await HandleClosing();
+        }
+
         protected virtual async Task FillPipeAsync(PipeWriter writer)
         {
             var options = Options;
+            var cts = _cts;
 
-            while (true)
+            while (!cts.IsCancellationRequested)
             {
                 try
                 {
@@ -102,7 +136,7 @@ namespace SuperSocket.Channel
 
                     var memory = writer.GetMemory(bufferSize);
 
-                    var bytesRead = await FillPipeWithDataAsync(memory);         
+                    var bytesRead = await FillPipeWithDataAsync(memory, cts.Token);         
 
                     if (bytesRead == 0)
                     {
@@ -117,7 +151,7 @@ namespace SuperSocket.Channel
                 catch (Exception e)
                 {
                     if (!IsIgnorableException(e))
-                        Logger.LogError(e, "Exception happened in ReceiveAsync");
+                        OnError("Exception happened in ReceiveAsync", e);
                     
                     break;
                 }
@@ -138,10 +172,16 @@ namespace SuperSocket.Channel
 
         protected virtual bool IsIgnorableException(Exception e)
         {
+            if (e is ObjectDisposedException || e is NullReferenceException)
+                return true;
+
+            if (e.InnerException != null)
+                return IsIgnorableException(e.InnerException);
+
             return false;
         }
 
-        protected abstract ValueTask<int> FillPipeWithDataAsync(Memory<byte> memory);
+        protected abstract ValueTask<int> FillPipeWithDataAsync(Memory<byte> memory, CancellationToken cancellationToken);
 
         protected virtual async Task ProcessReads()
         {
@@ -156,10 +196,11 @@ namespace SuperSocket.Channel
         protected async Task ProcessSends()
         {
             var output = Out.Reader;
+            var cts = _cts;
 
-            while (true)
+            while (!cts.IsCancellationRequested)
             {
-                var result = await output.ReadAsync();
+                var result = await output.ReadAsync(cts.Token);
 
                 if (result.IsCanceled)
                     break;
@@ -173,13 +214,16 @@ namespace SuperSocket.Channel
                 {
                     try
                     {
-                        await SendOverIOAsync(buffer);
+                        await SendOverIOAsync(buffer, cts.Token);
                         LastActiveTime = DateTimeOffset.Now;
                     }
                     catch (Exception e)
                     {
-                        Logger.LogError(e, "Exception happened in SendAsync");
                         output.Complete(e);
+                        
+                        if (!IsIgnorableException(e))
+                            OnError("Exception happened in SendAsync", e);
+                        
                         return;
                     }
                 }
@@ -204,46 +248,64 @@ namespace SuperSocket.Channel
             }
         }
 
-        protected abstract ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer);
+        protected abstract ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken);
 
 
         public override async ValueTask SendAsync(ReadOnlyMemory<byte> buffer)
         {
-            var writer = Out.Writer;
-            WriteBuffer(writer, buffer);
-            await writer.FlushAsync();
+            try
+            {
+                await _sendLock.WaitAsync();
+                var writer = Out.Writer;
+                WriteBuffer(writer, buffer);
+                await writer.FlushAsync();
+            }
+            finally
+            {
+                _sendLock.Release();
+            }            
         }
 
         private void WriteBuffer(PipeWriter writer, ReadOnlyMemory<byte> buffer)
         {
-            lock (writer)
-            {
-                CheckChannelOpen();
-                writer.Write(buffer.Span);
-            }
+            CheckChannelOpen();
+            writer.Write(buffer.Span);
         }
 
         public override async ValueTask SendAsync<TPackage>(IPackageEncoder<TPackage> packageEncoder, TPackage package)
         {
-            var writer = Out.Writer;
-            WritePackageWithEncoder<TPackage>(writer, packageEncoder, package);
-            await writer.FlushAsync();
+            try
+            {
+                await _sendLock.WaitAsync();
+                var writer = Out.Writer;
+                WritePackageWithEncoder<TPackage>(writer, packageEncoder, package);
+                await writer.FlushAsync();
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
         }
 
         public override async ValueTask SendAsync(Action<PipeWriter> write)
         {
-            var writer = Out.Writer;
-            write(writer);
-            await writer.FlushAsync();
+            try
+            {
+                await _sendLock.WaitAsync();
+                var writer = Out.Writer;
+                write(writer);
+                await writer.FlushAsync();
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
         }
 
         private void WritePackageWithEncoder<TPackage>(PipeWriter writer, IPackageEncoder<TPackage> packageEncoder, TPackage package)
         {
-            lock (writer)
-            {
-                CheckChannelOpen();
-                packageEncoder.Encode(writer, package);
-            }
+            CheckChannelOpen();
+            packageEncoder.Encode(writer, package);
         }
 
         protected internal ArraySegment<T> GetArrayByMemory<T>(ReadOnlyMemory<T> memory)
@@ -258,9 +320,11 @@ namespace SuperSocket.Channel
 
         protected async Task ReadPipeAsync(PipeReader reader)
         {
-            while (true)
+            var cts = _cts;
+
+            while (!cts.IsCancellationRequested)
             {
-                var result = await reader.ReadAsync();
+                var result = await reader.ReadAsync(cts.Token);
 
                 var buffer = result.Buffer;
 
@@ -271,7 +335,6 @@ namespace SuperSocket.Channel
                 {
                     if (result.IsCanceled)
                     {
-                        WriteEOFPackage();
                         break;
                     }
 
@@ -288,16 +351,14 @@ namespace SuperSocket.Channel
 
                     if (completed)
                     {
-                        WriteEOFPackage();
                         break;
                     }
                 }
                 catch (Exception e)
                 {
-                    Logger.LogCritical(e, "Protocol error");
+                    OnError("Protocol error", e);
                     // close the connection if get a protocol error
                     Close();
-                    WriteEOFPackage();
                     break;
                 }
                 finally
@@ -307,6 +368,7 @@ namespace SuperSocket.Channel
             }
 
             reader.Complete();
+            WriteEOFPackage();
         }
 
         private void WriteEOFPackage()
@@ -350,7 +412,7 @@ namespace SuperSocket.Channel
 
                 if (maxPackageLength > 0 && len > maxPackageLength)
                 {
-                    Logger.LogError($"Package cannot be larger than {maxPackageLength}.");
+                    OnError($"Package cannot be larger than {maxPackageLength}.");
                     // close the the connection directly
                     Close();
                     return false;
@@ -375,6 +437,22 @@ namespace SuperSocket.Channel
                 
                 seqReader = new SequenceReader<byte>(seqReader.Sequence.Slice(bytesConsumed));
             }
+        }
+    
+        public override async ValueTask DetachAsync()
+        {
+            _isDetaching = true;
+            _cts.Cancel();
+            await HandleClosing();
+            _isDetaching = false;
+        }
+
+        protected void OnError(string message, Exception e = null)
+        {
+            if (e != null)
+                Logger?.LogError(e, message);
+            else
+                Logger?.LogError(message);
         }
     }
 }

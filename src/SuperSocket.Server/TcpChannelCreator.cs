@@ -15,11 +15,11 @@ namespace SuperSocket.Server
 
         private CancellationTokenSource _cancellationTokenSource;
         private TaskCompletionSource<bool> _stopTaskCompletionSource;
-        private readonly Func<Socket, Task<IChannel>> _channelFactory;
+        private readonly Func<Socket, ValueTask<IChannel>> _channelFactory;
         public ListenOptions Options { get; }
         private ILogger _logger;
 
-        public TcpChannelCreator(ListenOptions options, Func<Socket, Task<IChannel>> channelFactory, ILogger logger)
+        public TcpChannelCreator(ListenOptions options, Func<Socket, ValueTask<IChannel>> channelFactory, ILogger logger)
         {
             Options = options;
             _channelFactory = channelFactory;
@@ -80,7 +80,7 @@ namespace SuperSocket.Server
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "The listener failed to start.");
+                _logger.LogError(e, $"The listener[{this.ToString()}] failed to start.");
                 return false;
             }
         }
@@ -92,11 +92,26 @@ namespace SuperSocket.Server
                 try
                 {
                     var client = await listenSocket.AcceptAsync();
-                    await OnNewClientAccept(client);
+                    OnNewClientAccept(client);
                 }
-                catch (Exception)
+                catch (Exception e)
                 {
-                    break;
+                    if (e is ObjectDisposedException || e is NullReferenceException)
+                        break;
+                    
+                    if (e is SocketException se)
+                    {
+                        var errorCode = se.ErrorCode;
+
+                        //The listen socket was closed
+                        if (errorCode == 125 || errorCode == 89 || errorCode == 995 || errorCode == 10004 || errorCode == 10038)
+                        {
+                            break;
+                        }
+                    }
+                    
+                    _logger.LogError(e, $"Listener[{this.ToString()}] failed to do AcceptAsync");
+                    continue;
                 }
             }
 
@@ -105,7 +120,7 @@ namespace SuperSocket.Server
 
         public event NewClientAcceptHandler NewClientAccepted;
 
-        private async Task OnNewClientAccept(Socket socket)
+        private async void OnNewClientAccept(Socket socket)
         {
             var handler = NewClientAccepted;
 

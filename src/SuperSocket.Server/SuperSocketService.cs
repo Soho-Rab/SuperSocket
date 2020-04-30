@@ -53,6 +53,11 @@ namespace SuperSocket.Server
 
         private IMiddleware[] _middlewares;
 
+        protected IMiddleware[] Middlewares
+        {
+            get { return _middlewares; }
+        }
+
         private ServerState _state = ServerState.None;
 
         public ServerState State
@@ -70,7 +75,6 @@ namespace SuperSocket.Server
             Name = serverOptions.Value.Name;
             _serviceProvider = serviceProvider;
             _pipelineFilterFactory = GetPipelineFilterFactory();
-            _serverOptions = serverOptions;
             _loggerFactory = loggerFactory;
             _logger = _loggerFactory.CreateLogger("SuperSocketService");
             _channelCreatorFactory = channelCreatorFactory;
@@ -251,12 +255,18 @@ namespace SuperSocket.Server
 
         protected virtual async ValueTask FireSessionConnectedEvent(AppSession session)
         {
+            if (session is IHandshakeRequiredSession hanshakeSession)
+            {
+                if (!hanshakeSession.Handshaked)
+                    return;
+            }
+
             _logger.LogInformation($"A new session connected: {session.SessionID}");
 
             try
             {
                 Interlocked.Increment(ref _sessionCount);
-                session.OnSessionConnected();
+                await session.FireSessionConnectedAsync();
                 await OnSessionConnectedAsync(session);
             }
             catch (Exception e)
@@ -267,12 +277,18 @@ namespace SuperSocket.Server
 
         protected virtual async ValueTask FireSessionClosedEvent(AppSession session)
         {
+            if (session is IHandshakeRequiredSession hanshakeSession)
+            {
+                if (!hanshakeSession.Handshaked)
+                    return;
+            }
+
             _logger.LogInformation($"The session disconnected: {session.SessionID}");
 
             try
             {
                 Interlocked.Decrement(ref _sessionCount);
-                session.OnSessionClosed(EventArgs.Empty);
+                await session.FireSessionClosedAsync(EventArgs.Empty);
                 await OnSessionClosedAsync(session); 
             }
             catch (Exception exc)
@@ -304,14 +320,14 @@ namespace SuperSocket.Server
 
                         if (toClose)
                         {
-                            session.Close();
+                            session.CloseAsync().DoNotAwait();
                         }
                     }                    
                 }
             }
             catch (Exception e)
             {
-                _logger.LogError($"Failed to handle the session {session.SessionID}.", e);
+                _logger.LogError(e, $"Failed to handle the session {session.SessionID}.");
             }
             finally
             {
@@ -321,7 +337,7 @@ namespace SuperSocket.Server
 
         protected virtual ValueTask<bool> OnSessionErrorAsync(IAppSession session, PackageHandlingException<TReceivePackageInfo> exception)
         {
-            _logger.LogError($"Session[{session.SessionID}]: session exception.", exception);
+            _logger.LogError(exception, $"Session[{session.SessionID}]: session exception.");
             return new ValueTask<bool>(true);
         }
 
@@ -431,6 +447,11 @@ namespace SuperSocket.Server
 
                 disposedValue = true;
             }
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            DisposeAsync(disposing).GetAwaiter().GetResult();
         }
 
         void IDisposable.Dispose()

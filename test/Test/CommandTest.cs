@@ -15,13 +15,20 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 using Xunit.Abstractions;
+using SuperSocket.Server;
+using System.Threading;
 
 namespace Tests
 {
     [Trait("Category", "Command")]
     public class CommandTest : TestClassBase
     {
-        class ADD : IAsyncCommand<StringPackageInfo>
+        public class MySession : AppSession
+        {
+
+        }
+        
+        public class ADD : IAsyncCommand<StringPackageInfo>
         {
             public async ValueTask ExecuteAsync(IAppSession session, StringPackageInfo package)
             {
@@ -33,7 +40,7 @@ namespace Tests
             }
         }
 
-        class MULT : IAsyncCommand<StringPackageInfo>
+        public class MULT : IAsyncCommand<StringPackageInfo>
         {
             public async ValueTask ExecuteAsync(IAppSession session, StringPackageInfo package)
             {
@@ -45,7 +52,7 @@ namespace Tests
             }
         }
 
-        class SUB : IAsyncCommand<StringPackageInfo>
+        public class SUB : IAsyncCommand<StringPackageInfo>
         {
             private IPackageEncoder<string> _encoder;
 
@@ -62,6 +69,58 @@ namespace Tests
                 
                 // encode the text message by encoder
                 await session.SendAsync(_encoder, result.ToString() + "\r\n");
+            }
+        }
+
+        public class DIV : IAsyncCommand<MySession, StringPackageInfo>
+        {
+            private IPackageEncoder<string> _encoder;
+
+            public DIV(IPackageEncoder<string> encoder)
+            {
+                _encoder = encoder;
+            }
+
+            public async ValueTask ExecuteAsync(MySession session, StringPackageInfo package)
+            {
+                var values = package
+                    .Parameters
+                    .Select(p => int.Parse(p))
+                    .ToArray();
+
+                var result = values[0] / values[1];
+
+                var socketSession = session as IAppSession;
+                // encode the text message by encoder
+                await socketSession.SendAsync(_encoder, result.ToString() + "\r\n");
+            }
+        }
+
+        public class PowData
+        {
+            public int X { get; set; }
+            public int Y { get; set; }
+        }
+
+        public class POW : JsonAsyncCommand<IAppSession, PowData>
+        {
+            protected override async ValueTask ExecuteJsonAsync(IAppSession session, PowData data)
+            {
+                await session.SendAsync(Encoding.UTF8.GetBytes($"{Math.Pow(data.X, data.Y)}\r\n"));
+            }
+        }
+
+        public class MaxData
+        {
+            public int[] Numbers { get; set; }
+        }
+
+        public class MAX : JsonAsyncCommand<IAppSession, MaxData>
+        {
+            protected override async ValueTask ExecuteJsonAsync(IAppSession session, MaxData data)
+            {
+                var maxValue = data.Numbers.OrderByDescending(i => i).FirstOrDefault();
+                await session.SendAsync(Encoding.UTF8.GetBytes($"{maxValue}\r\n"));
             }
         }
 
@@ -121,6 +180,135 @@ namespace Tests
                 }
 
                 await server.StopAsync();
+            }
+        }
+
+        [Theory]
+        [InlineData(typeof(RegularHostConfigurator))]
+        [InlineData(typeof(SecureHostConfigurator))]
+        [Trait("Category", "JsonCommands")]
+        public async Task TestJsonCommands(Type hostConfiguratorType)
+        {
+            var hostConfigurator = CreateObject<IHostConfigurator>(hostConfiguratorType);
+            using (var server = CreateSocketServerBuilder<StringPackageInfo, CommandLinePipelineFilter>(hostConfigurator)
+                .UseCommand(commandOptions =>
+                {
+                    // register commands one by one
+                    commandOptions.AddCommand<POW>();
+                    commandOptions.AddCommand<MAX>();
+
+                }).BuildAsServer())
+            {
+
+                Assert.Equal("TestServer", server.Name);
+
+                Assert.True(await server.StartAsync());
+                OutputHelper.WriteLine("Server started.");
+
+
+                var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await client.ConnectAsync(new IPEndPoint(IPAddress.Parse("127.0.0.1"), 4040));
+                OutputHelper.WriteLine("Connected.");
+
+                using (var stream = await hostConfigurator.GetClientStream(client))
+                using (var streamReader = new StreamReader(stream, Utf8Encoding, true))
+                using (var streamWriter = new StreamWriter(stream, Utf8Encoding, 1024 * 1024 * 4))
+                {
+                    await streamWriter.WriteAsync("POW { \"x\": 2, \"y\": 2 }\r\n");
+                    await streamWriter.FlushAsync();
+                    var line = await streamReader.ReadLineAsync();
+                    Assert.Equal("4", line);
+
+                    await streamWriter.WriteAsync("MAX { \"numbers\": [ 45, 77, 6, 88, 46 ] }\r\n");
+                    await streamWriter.FlushAsync();
+                    line = await streamReader.ReadLineAsync();
+                    Assert.Equal("88", line);
+                }
+
+                await server.StopAsync();
+            }
+        }
+
+        [Theory]
+        [InlineData(typeof(RegularHostConfigurator))]
+        [InlineData(typeof(SecureHostConfigurator))]
+        public async Task TestCommandsWithCustomSession(Type hostConfiguratorType)
+        {
+            var hostConfigurator = CreateObject<IHostConfigurator>(hostConfiguratorType);
+            using (var server = CreateSocketServerBuilder<StringPackageInfo, CommandLinePipelineFilter>(hostConfigurator)
+                .UseCommand(commandOptions =>
+                {
+                    // register commands one by one
+                    /*
+                    commandOptions.AddCommand<ADD>();
+                    commandOptions.AddCommand<MULT>();
+                    commandOptions.AddCommand<SUB>();
+                    commandOptions.AddCommand<DIV>();
+                    */
+                    // register all commands in one aassembly
+                    commandOptions.AddCommandAssembly(typeof(SUB).GetTypeInfo().Assembly);
+                })
+                .UseSession<MySession>()
+                .BuildAsServer())
+            {
+
+                Assert.Equal("TestServer", server.Name);
+
+                Assert.True(await server.StartAsync());
+                OutputHelper.WriteLine("Server started.");
+
+
+                var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await client.ConnectAsync(new IPEndPoint(IPAddress.Parse("127.0.0.1"), 4040));
+                OutputHelper.WriteLine("Connected.");
+
+                using (var stream = await hostConfigurator.GetClientStream(client))
+                using (var streamReader = new StreamReader(stream, Utf8Encoding, true))
+                using (var streamWriter = new StreamWriter(stream, Utf8Encoding, 1024 * 1024 * 4))
+                {
+                    await streamWriter.WriteAsync("ADD 1 2 3\r\n");
+                    await streamWriter.FlushAsync();
+                    var line = await streamReader.ReadLineAsync();
+                    Assert.Equal("6", line);
+
+                    await streamWriter.WriteAsync("MULT 2 5\r\n");
+                    await streamWriter.FlushAsync();
+                    line = await streamReader.ReadLineAsync();
+                    Assert.Equal("10", line);
+
+                    await streamWriter.WriteAsync("SUB 8 2\r\n");
+                    await streamWriter.FlushAsync();
+                    line = await streamReader.ReadLineAsync();
+                    Assert.Equal("6", line);
+
+                    await streamWriter.WriteAsync("DIV 8 2\r\n");
+                    await streamWriter.FlushAsync();
+                    line = await streamReader.ReadLineAsync();
+                    Assert.Equal("4", line);
+                }
+
+                await server.StopAsync();
+            }
+        }
+
+        class HitCountCommandFilterAttribute : AsyncCommandFilterAttribute
+        {
+            private static int _total;
+
+            public static int Total
+            {
+                get { return _total; }
+            }
+
+            public override ValueTask OnCommandExecutedAsync(CommandExecutingContext commandContext)
+            {
+                Interlocked.Increment(ref _total);
+                return new ValueTask();
+            }
+
+            public override ValueTask<bool> OnCommandExecutingAsync(CommandExecutingContext commandContext)
+            {
+                return new ValueTask<bool>(true);
             }
         }
 
@@ -204,6 +392,7 @@ namespace Tests
                 {
                     commandOptions.AddCommand<COUNT>();
                     commandOptions.AddCommand<COUNTDOWN>();
+                    commandOptions.AddGlobalCommandFilter<HitCountCommandFilterAttribute>();
                 })
                 .ConfigureSessionHandler((s) =>
                 {
@@ -227,6 +416,8 @@ namespace Tests
                 using (var streamReader = new StreamReader(stream, Utf8Encoding, true))
                 using (var streamWriter = new StreamWriter(stream, Utf8Encoding, 1024 * 1024 * 4))
                 {
+                    var currentTotal = HitCountCommandFilterAttribute.Total;
+
                     for (var i = 1; i <= 100; i++)
                     {
                         await streamWriter.WriteAsync("COUNT\r\n");
@@ -236,6 +427,8 @@ namespace Tests
                         Assert.Equal(i, sessionState.ExecutionCount);
                     }
 
+                    Assert.Equal(currentTotal + 100, HitCountCommandFilterAttribute.Total);
+
                     for (var i = 99; i >= 0; i--)
                     {
                         await streamWriter.WriteAsync("COUNTDOWN\r\n");
@@ -244,6 +437,8 @@ namespace Tests
 
                         Assert.Equal(i, sessionState.ExecutionCount);
                     }
+
+                    Assert.Equal(currentTotal + 200, HitCountCommandFilterAttribute.Total);
                 }
 
                 await server.StopAsync();

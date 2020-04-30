@@ -46,21 +46,55 @@ namespace SuperSocket.WebSocket
             }
         }
 
-        private int EncodeFragment(IBufferWriter<byte> writer, OpCode opCode, int expectedHeadLength, ReadOnlySpan<char> text, bool isFinal)
+        private int EncodeEmptyFragment(IBufferWriter<byte> writer, OpCode opCode, int expectedHeadLength)
         {
+            return EncodeSingleFragment(writer, opCode, expectedHeadLength, default);
+        }
+
+        private int EncodeFragment(IBufferWriter<byte> writer, OpCode opCode, int expectedHeadLength, int fragmentSize, ReadOnlySpan<char> text, Encoder encoder, out int charsUsed)
+        {
+            charsUsed = 0;
+
             var head = writer.GetSpan(expectedHeadLength);
 
             var opCodeFlag = (byte)opCode;            
+
+            writer.Advance(expectedHeadLength);
+
+            var buffer = writer.GetSpan(fragmentSize).Slice(0, fragmentSize);
+            
+            encoder.Convert(text, buffer, false, out charsUsed, out int bytesUsed, out bool completed);
+            writer.Advance(bytesUsed);
+
+            var totalBytes = bytesUsed;
+            var isFinal = completed && text.Length == charsUsed;
+
             if (isFinal)
                 opCodeFlag = (byte)(opCodeFlag | 0x80);
 
             head[0] = opCodeFlag;
 
+            WriteLength(ref head, totalBytes);
+
+            return totalBytes + expectedHeadLength;
+        }
+
+        private int EncodeSingleFragment(IBufferWriter<byte> writer, OpCode opCode, int expectedHeadLength, ReadOnlySpan<char> text)
+        {
+            var head = writer.GetSpan(expectedHeadLength);
+
+            var opCodeFlag = (byte)opCode;
+
+            opCodeFlag = (byte)(opCodeFlag | 0x80);
+
+            head[0] = opCodeFlag;
+
             writer.Advance(expectedHeadLength);
-            
-            var totalBytes = writer.Write(text, _textEncoding);
+
+            var totalBytes = text.Length > 0 ? writer.Write(text, _textEncoding) : 0;
 
             WriteLength(ref head, totalBytes);
+
             return totalBytes + expectedHeadLength;
         }
 
@@ -77,7 +111,6 @@ namespace SuperSocket.WebSocket
             foreach (var dataPiece in pack.Data)
             {
                 writer.Write(dataPiece.Span);
-                writer.Advance(dataPiece.Length);
             }
 
             return (int)(pack.Data.Length + headLen);
@@ -87,31 +120,36 @@ namespace SuperSocket.WebSocket
         {
             if (pack.OpCode != OpCode.Text)
                 return EncodeBinaryMessage(writer, pack);
-            
-            var minSzie = pack.Message.Length;
-            var maxSize = _textEncoding.GetMaxByteCount(pack.Message.Length);
+
+            var msgSize = !string.IsNullOrEmpty(pack.Message) ? pack.Message.Length : 0;
+
+            if (msgSize == 0)
+                return EncodeEmptyFragment(writer, pack.OpCode, 2);
+
+            var minSize = msgSize;
+            var maxSize = _textEncoding.GetMaxByteCount(msgSize);
 
             var fragmentSize = 0;
             var headLen = 0;
 
             if (maxSize < _size0)
                 headLen =  2;
-            else if (minSzie >= _size0 && maxSize < _size1)
+            else if (minSize >= _size0 && maxSize < _size1)
                 headLen = 4;
-            else if (minSzie >= _size1)
+            else if (minSize >= _size1)
                 headLen = 10;
 
             if (headLen == 0)
             {
-                if (minSzie < _size0 || maxSize >= _size0)
+                if (minSize < _size0 || maxSize >= _size0)
                 {
                     headLen =  2;
-                    fragmentSize = _size0 / 2;
+                    fragmentSize = _size0 - 1;
                 }
                 else
                 {
                     headLen =  4;
-                    fragmentSize = _size1 / 2;
+                    fragmentSize = _size1 - 1;
                 }
             }
 
@@ -120,25 +158,25 @@ namespace SuperSocket.WebSocket
 
             if (fragmentSize == 0)
             {
-                total += EncodeFragment(writer, pack.OpCode, headLen, text, true);
+                total += EncodeSingleFragment(writer, pack.OpCode, headLen, text);
             }
             else
             {
-                var isFinal = false;
+                var isContinuation = false;
+                var encoder = _textEncoding.GetEncoder();
 
-                while (!isFinal)
+                while (true)
                 {
-                    isFinal = text.Length <= fragmentSize;
-                    var textInFragment = text;
-                    
-                    if (!isFinal)
-                    {
-                        textInFragment = text.Slice(0, fragmentSize);
-                        text = text.Slice(fragmentSize);
-                    }
+                    total += EncodeFragment(writer, isContinuation ? OpCode.Continuation : pack.OpCode, headLen, fragmentSize, text, encoder, out int charsUsed);
 
-                    total += EncodeFragment(writer, pack.OpCode, headLen, textInFragment, isFinal);
-                }                
+                    if (text.Length <= charsUsed)
+                        break;
+
+                    text = text.Slice(charsUsed);
+                    
+                    if (!isContinuation)
+                        isContinuation = true;
+                }
             }
 
             return total;

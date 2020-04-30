@@ -8,7 +8,7 @@ using SuperSocket.Server;
 
 namespace SuperSocket.WebSocket.Server
 {
-    public class WebSocketSession : AppSession
+    public class WebSocketSession : AppSession, IHandshakeRequiredSession
     {
         public bool Handshaked { get; internal set; }
 
@@ -31,10 +31,7 @@ namespace SuperSocket.WebSocket.Server
 
         public virtual ValueTask SendAsync(WebSocketMessage message)
         {
-            lock (Channel)
-            {
-                return this.Channel.SendAsync(_messageEncoder, message);
-            }
+            return this.Channel.SendAsync(_messageEncoder, message);
         }
 
         public virtual ValueTask SendAsync(string message)
@@ -102,25 +99,25 @@ namespace SuperSocket.WebSocket.Server
 
         internal void CloseWithoutHandshake()
         {
-            base.Close();
+            base.CloseAsync().DoNotAwait();
         }
 
-        public new void Close()
+        public override async ValueTask CloseAsync()
         {
             if (CloseStatus != null)
             {
-                base.Close();
+                await base.CloseAsync();
                 return;
             }
 
             try
             {
-                CloseAsync(CloseReason.NormalClosure).GetAwaiter().GetResult();
+                await CloseAsync(CloseReason.NormalClosure);
             }
             catch
             {
 
-            }            
+            }
         }
     }
 }

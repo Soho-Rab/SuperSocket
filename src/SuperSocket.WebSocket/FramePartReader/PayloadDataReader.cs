@@ -24,15 +24,27 @@ namespace SuperSocket.WebSocket.FramePartReader
             var seq = reader.Sequence.Slice(reader.Consumed, required);
 
             if (package.HasMask)
-                DecodeMask(seq, package.MaskKey);
-
-            if (package.Data.Length == 0)
-                package.Data = seq;
-            else
-                package.Data = ConcactSequence(package.Data, seq);
+                DecodeMask(ref seq, package.MaskKey);
 
             try
             {
+                if (package.Data.Length == 0)
+                {
+                    if (package.FIN && package.OpCode == OpCode.Text)
+                    {
+                        package.Message = seq.GetString(Encoding.UTF8);
+                        return true;
+                    }
+
+                    var empty = ReadOnlySequence<byte>.Empty;
+                    package.Data = ConcactSequence(ref seq, ref empty);
+                }
+                else
+                {
+                    var currentData = package.Data;
+                    package.Data = ConcactSequence(ref currentData, ref seq);
+                }
+
                 if (package.FIN)
                 {
                     if (package.OpCode == OpCode.Text)
@@ -56,7 +68,7 @@ namespace SuperSocket.WebSocket.FramePartReader
             }
         }
 
-        private ReadOnlySequence<byte> ConcactSequence(ReadOnlySequence<byte> first, ReadOnlySequence<byte> second)
+        private ReadOnlySequence<byte> ConcactSequence(ref ReadOnlySequence<byte> first, ref ReadOnlySequence<byte> second)
         {
             SequenceSegment head = first.Start.GetObject() as SequenceSegment;
             SequenceSegment tail = first.End.GetObject() as SequenceSegment;
@@ -66,21 +78,24 @@ namespace SuperSocket.WebSocket.FramePartReader
                 foreach (var segment in first)
                 {                
                     if (head == null)
-                        tail = head = new SequenceSegment(segment);
+                        tail = head = SequenceSegment.CopyFrom(segment);
                     else
-                        tail = tail.SetNext(segment);
+                        tail = tail.SetNext(SequenceSegment.CopyFrom(segment));
                 }
             }
 
-            foreach (var segment in second)
+            if (!second.IsEmpty)
             {
-                tail = tail.SetNext(segment);
+                foreach (var segment in second)
+                {
+                    tail = tail.SetNext(SequenceSegment.CopyFrom(segment));
+                }
             }
 
             return new ReadOnlySequence<byte>(head, 0, tail, tail.Memory.Length);
         }
 
-        internal unsafe void DecodeMask(ReadOnlySequence<byte> sequence, byte[] mask)
+        internal unsafe void DecodeMask(ref ReadOnlySequence<byte> sequence, byte[] mask)
         {
             var index = 0;
             var maskLen = mask.Length;

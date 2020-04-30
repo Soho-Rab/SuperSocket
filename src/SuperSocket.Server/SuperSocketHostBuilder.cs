@@ -25,11 +25,12 @@ namespace SuperSocket
 
         public IDictionary<object, object> Properties => _hostBuilder.Properties;
 
-        public IHost Build()
+        public virtual IHost Build()
         {
             return _hostBuilder.ConfigureServices((ctx, services) => 
             {
-                services.TryAdd(new ServiceDescriptor(typeof(IPackageEncoder<string>), typeof(DefaultStringEncoderForDI), ServiceLifetime.Singleton));
+                services.TryAdd(ServiceDescriptor.Singleton<IChannelCreatorFactory, TcpChannelCreatorFactory>());
+                services.TryAdd(ServiceDescriptor.Singleton<IPackageEncoder<string>, DefaultStringEncoderForDI>());
             }).Build();
         }
 
@@ -109,6 +110,16 @@ namespace SuperSocket
             return new SuperSocketHostBuilder<TReceivePackage>()
                 .ConfigureDefaults()
                 .UseSuperSocket<TReceivePackage>(filterFactory) as IHostBuilder<TReceivePackage>;
+        }
+        
+        public static IHostBuilder<TReceivePackage> Create<TReceivePackage, TSuperSocketService, TPipelineFilter>()
+            where TReceivePackage : class
+            where TPipelineFilter : IPipelineFilter<TReceivePackage>, new()
+            where TSuperSocketService : SuperSocketService<TReceivePackage>
+        {
+            return new SuperSocketHostBuilder<TReceivePackage>()
+                .ConfigureDefaults()
+                .UseSuperSocket<TReceivePackage, TPipelineFilter, TSuperSocketService>() as IHostBuilder<TReceivePackage>;
         }
     }
 }

@@ -29,5 +29,16 @@ namespace SuperSocket.WebSocket.FramePartReader
         protected static IPackagePartReader<WebSocketPackage> MaskKeyReader { get; private set; }
 
         protected static IPackagePartReader<WebSocketPackage> PayloadDataReader { get; private set; }
+
+        protected bool TryInitIfEmptyMessage(WebSocketPackage package)
+        {
+            if (package.PayloadLength != 0)
+                return false;
+
+            if (package.OpCode == OpCode.Text)
+                package.Message = string.Empty;
+
+            return true;
+        }
     }
 }

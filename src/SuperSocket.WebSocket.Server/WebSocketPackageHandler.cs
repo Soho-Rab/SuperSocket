@@ -5,6 +5,8 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SuperSocket;
 using SuperSocket.ProtoBase;
 using SuperSocket.Server;
@@ -25,7 +27,11 @@ namespace SuperSocket.WebSocket.Server
 
         private ISubProtocolSelector _subProtocolSelector;
 
-        public WebSocketPackageHandler(IServiceProvider serviceProvider)
+        private ILogger _logger;
+
+        private readonly HandshakeOptions _handshakeOptions;
+
+        public WebSocketPackageHandler(IServiceProvider serviceProvider, ILoggerFactory loggerFactory, IOptions<HandshakeOptions> handshakeOptions)
         {
             _serviceProvider = serviceProvider;
 
@@ -34,10 +40,20 @@ namespace SuperSocket.WebSocket.Server
 
             _packageHandlerDelegate = serviceProvider.GetService<Func<WebSocketSession, WebSocketPackage, Task>>();
             _subProtocolSelector = serviceProvider.GetService<ISubProtocolSelector>();
+            _logger = loggerFactory.CreateLogger<WebSocketPackageHandler>();
+            _handshakeOptions = handshakeOptions.Value;
         }
 
         private CloseStatus GetCloseStatusFromPackage(WebSocketPackage package)
         {
+            if (package.Data.Length < 2)
+            {
+                return new CloseStatus
+                {
+                    Reason = CloseReason.NormalClosure
+                };
+            }
+
             var reader = new SequenceReader<byte>(package.Data);
 
             reader.TryReadBigEndian(out short closeReason);
@@ -65,7 +81,10 @@ namespace SuperSocket.WebSocket.Server
 
                 // handshake failure
                 if (!(await HandleHandshake(websocketSession, package)))
+                {
+                    websocketSession.CloseWithoutHandshake();
                     return;
+                }
 
                 websocketSession.Handshaked = true;
 
@@ -118,14 +137,20 @@ namespace SuperSocket.WebSocket.Server
                     message.OpCode = OpCode.Close;
                     message.Data = package.Data;
 
-                    await websocketSession.SendAsync(message);
-                }  
+                    try
+                    {
+                        await websocketSession.SendAsync(message);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                         // support the case the client close the connection right after it send the close handshake
+                    }
+                }
                 else
                 {
-                    //After both sending and receiving a Close message, the server MUST close the underlying TCP connection immediately
                     websocketSession.CloseWithoutHandshake();
                 }
-
+                
                 return;
             }
             else if (package.OpCode == OpCode.Ping)
@@ -167,6 +192,14 @@ namespace SuperSocket.WebSocket.Server
             if (string.IsNullOrEmpty(secWebSocketKey))
             {
                 return false;
+            }
+
+            var handshakeValidator = _handshakeOptions?.HandshakeValidator;
+
+            if (handshakeValidator != null)
+            {
+                if (!await handshakeValidator(session as WebSocketSession, p))
+                    return false;
             }
 
             string secKeyAccept = string.Empty;
