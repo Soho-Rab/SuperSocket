@@ -5,7 +5,7 @@ using System.Threading.Tasks.Sources;
 
 namespace SuperSocket.Channel
 {
-    internal class DefaultObjectPipe<T> : IObjectPipe<T>, IValueTaskSource<T>, IDisposable
+    class DefaultObjectPipe<T> : IObjectPipe<T>, IValueTaskSource<T>, IDisposable
     {
         class BufferSegment
         {
@@ -141,14 +141,26 @@ namespace SuperSocket.Channel
                     }
                     
                     _length--;
+
+                    if (_length == 0)
+                        OnWaitTaskStart();
+
                     return new ValueTask<T>(value);
                 }                    
 
                 _waiting = true;
                 _lastReadIsWait = true;
                 _taskSourceCore.Reset();
+
+                OnWaitTaskStart();
+
                 return new ValueTask<T>(this, _taskSourceCore.Version);
             }            
+        }
+
+        protected virtual void OnWaitTaskStart()
+        {
+
         }
 
         T IValueTaskSource<T>.GetResult(short token)
@@ -199,6 +211,79 @@ namespace SuperSocket.Channel
         {
             Dispose(true);
         }
+
         #endregion
+    }
+
+    class DefaultObjectPipeWithSupplyControl<T> : DefaultObjectPipe<T>, IValueTaskSource, ISupplyController
+    {
+        private ManualResetValueTaskSourceCore<bool> _taskSourceCore;
+
+        private bool _currentInTask;
+
+        private bool _inWaiting = false;
+
+        public DefaultObjectPipeWithSupplyControl()
+            : base()
+        {
+            _taskSourceCore = new ManualResetValueTaskSourceCore<bool>();
+        }
+
+        public ValueTask SupplyRequired()
+        {
+            lock (this)
+            {
+                if (_inWaiting)
+                {
+                    return new ValueTask();
+                }
+
+                _currentInTask = true;
+                _inWaiting = true;
+                _taskSourceCore.Reset();
+                return new ValueTask(this, _taskSourceCore.Version);
+            }
+        }
+
+        protected override void OnWaitTaskStart()
+        {
+            SetTaskCompleted(true);
+        }
+
+        public void SupplyEnd()
+        {
+            SetTaskCompleted(false);
+        }
+
+        private void SetTaskCompleted(bool result)
+        {
+            lock (this)
+            {
+                if (!_currentInTask)
+                {
+                    _inWaiting = true;
+                    return;
+                }
+                
+                _taskSourceCore.SetResult(result);
+                _inWaiting = false;
+                _currentInTask = false;
+            }
+        }
+
+        void IValueTaskSource.GetResult(short token)
+        {
+            _taskSourceCore.GetResult(token);
+        }
+
+        ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)
+        {
+            return _taskSourceCore.GetStatus(token);
+        }
+
+        void IValueTaskSource.OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
+        {
+            _taskSourceCore.OnCompleted(continuation, state, token, flags);
+        }
     }
 }
