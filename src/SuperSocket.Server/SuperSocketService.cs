@@ -67,15 +67,21 @@ namespace SuperSocket.Server
 
         private SessionHandlers _sessionHandlers;
 
-        public SuperSocketService(IServiceProvider serviceProvider, IOptions<ServerOptions> serverOptions, ILoggerFactory loggerFactory, IChannelCreatorFactory channelCreatorFactory)
+        public SuperSocketService(IServiceProvider serviceProvider, IOptions<ServerOptions> serverOptions)
         {
-            _serverOptions = serverOptions;
+            if (serviceProvider == null)
+                throw new ArgumentNullException(nameof(serviceProvider));
+
+            if (serverOptions == null)
+                throw new ArgumentNullException(nameof(serverOptions));
+
             Name = serverOptions.Value.Name;
-            _serviceProvider = serviceProvider;
+            _serverOptions = serverOptions;
+            _serviceProvider = serviceProvider = serviceProvider.GetService<IServiceProviderAccessor>()?.ServiceProvider ?? serviceProvider;
             _pipelineFilterFactory = GetPipelineFilterFactory();
-            _loggerFactory = loggerFactory;
+            _loggerFactory = serviceProvider.GetService<ILoggerFactory>();
             _logger = _loggerFactory.CreateLogger("SuperSocketService");
-            _channelCreatorFactory = channelCreatorFactory;
+            _channelCreatorFactory = serviceProvider.GetService<IChannelCreatorFactory>() ?? new TcpChannelCreatorFactory(serviceProvider);
             _sessionHandlers = serviceProvider.GetService<SessionHandlers>();          
             // initialize session factory
             _sessionFactory = serviceProvider.GetService<ISessionFactory>() ?? new DefaultSessionFactory();
@@ -163,7 +169,6 @@ namespace SuperSocket.Server
 
                     if (!AddChannelCreator(l, serverOptions))
                     {
-                        _logger.LogError($"Failed to listen {l}.");
                         continue;
                     }
                 }
@@ -304,6 +309,8 @@ namespace SuperSocket.Server
 
             try
             {
+                channel.Start();
+                
                 await FireSessionConnectedEvent(session);
 
                 var packageChannel = channel as IChannel<TReceivePackageInfo>;

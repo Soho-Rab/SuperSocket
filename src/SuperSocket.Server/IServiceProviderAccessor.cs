@@ -6,10 +6,8 @@ using SuperSocket.Channel;
 
 namespace SuperSocket.Server
 {
-    public class SessionHandlers
+    interface IServiceProviderAccessor
     {
-        public Func<IAppSession, ValueTask> Connected { get; set; }
-
-        public Func<IAppSession, ValueTask> Closed { get; set; }
+        IServiceProvider ServiceProvider { get; }
     }
 }
