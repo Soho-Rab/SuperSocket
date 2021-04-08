@@ -29,6 +29,68 @@ namespace SuperSocket.ProtoBase
                 reader.Advance(length);
             }
         }
+        public static bool TryReadBigEndian(ref this SequenceReader<byte> reader, out ushort value)
+        {
+            value = 0;
+
+            if (reader.Remaining < 2)
+                return false;
+
+            if (!reader.TryRead(out byte h))
+                return false;
+
+            if (!reader.TryRead(out byte l))
+                return false;
+
+            value = (ushort)(h * 256 + l);
+            return true;
+        }
+
+        public static bool TryReadBigEndian(ref this SequenceReader<byte> reader, out uint value)
+        {
+            value = 0;
+
+            if (reader.Remaining < 4)
+                return false;
+            
+            var v = 0;
+            var unit = (int)Math.Pow(256, 3);
+
+            for (var i = 0; i < 4; i++)
+            {
+                if (!reader.TryRead(out byte b))
+                    return false;
+
+                v += unit * b;
+                unit = unit / 256;
+            }
+
+            value = (uint)v;
+            return true;
+        }
+
+        public static bool TryReadBigEndian(ref this SequenceReader<byte> reader, out ulong value)
+        {
+            value = 0;
+
+            if (reader.Remaining < 8)
+                return false;
+            
+            var v = 0L;
+            var unit = (long)Math.Pow(256, 7);
+
+            for (var i = 0; i < 8; i++)
+            {
+                if (!reader.TryRead(out byte b))
+                    return false;
+                
+                v += unit * b;
+                unit = unit / 256;
+            }
+
+            value = (ulong)v;
+            return true;
+        }
         
         public static string GetString(this ReadOnlySequence<byte> buffer, Encoding encoding)
         {

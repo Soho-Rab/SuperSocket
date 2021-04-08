@@ -7,54 +7,80 @@ using SuperSocket.ProtoBase;
 
 namespace SuperSocket.WebSocket.Server
 {
+    class WebSocketHostBuilderAdapter : ServerHostBuilderAdapter<WebSocketPackage>
+    {
+        public WebSocketHostBuilderAdapter(IHostBuilder hostBuilder)
+            : base(hostBuilder)
+        {
+            this.UsePipelineFilter<WebSocketPipelineFilter>();
+            this.UseWebSocketMiddleware();
+            this.ConfigureServices((ctx, services) =>
+            {
+                services.AddSingleton<IPackageHandler<WebSocketPackage>, WebSocketPackageHandler>();
+            });
+            this.ConfigureSupplementServices(WebSocketHostBuilder.ValidateHostBuilder);
+        }
+
+        protected override void RegisterDefaultServices(HostBuilderContext builderContext, IServiceCollection servicesInHost, IServiceCollection services)
+        {
+            services.TryAddSingleton<ISessionFactory, GenericSessionFactory<WebSocketSession>>();
+        }
+    }
+
     public class WebSocketHostBuilder : SuperSocketHostBuilder<WebSocketPackage>
     {
         internal WebSocketHostBuilder()
+            : this(args: null)
         {
 
         }
-        public override IHost Build()
-        {
-            this.ConfigureServices((ctx, services) => 
-            {
-                services.TryAdd(new ServiceDescriptor(typeof(ISessionFactory), typeof(GenericSessionFactory<WebSocketSession>), ServiceLifetime.Singleton));
-            });
 
-            return base.Build();
+        internal WebSocketHostBuilder(IHostBuilder hostBuilder)
+            : base(hostBuilder)
+        {
+            
         }
 
-        protected override void RegisterDefaultHostedService(IServiceCollection services)
+        internal WebSocketHostBuilder(string[] args)
+            : base(args)
         {
-            services.AddHostedService<WebSocketService>();
+            this.ConfigureSupplementServices(WebSocketHostBuilder.ValidateHostBuilder);
         }
 
-        public new WebSocketHostBuilder UseHostedService<THostedService>()
-            where THostedService : WebSocketService
+        protected override void RegisterDefaultServices(HostBuilderContext builderContext, IServiceCollection servicesInHost, IServiceCollection services)
         {
-            return base.UseHostedService<THostedService>() as WebSocketHostBuilder;
-        }
-
-        public new SuperSocketHostBuilder<WebSocketPackage> UsePipelineFilter<TPipelineFilter>()
-            where TPipelineFilter : IPipelineFilter<WebSocketPackage>, new()
-        {
-            throw new NotSupportedException();
-        }
-
-        public new SuperSocketHostBuilder<WebSocketPackage> UsePipelineFilterFactory<TPipelineFilterFactory>()
-            where TPipelineFilterFactory : class, IPipelineFilterFactory<WebSocketPackage>
-        {
-            throw new NotSupportedException();
-        }
+            base.RegisterDefaultServices(builderContext, servicesInHost, services);
+            services.TryAddSingleton<ISessionFactory, GenericSessionFactory<WebSocketSession>>();
+        }        
 
         public static WebSocketHostBuilder Create()
         {
-            return ((new WebSocketHostBuilder() as SuperSocketHostBuilder<WebSocketPackage>)
-                .UsePipelineFilter<WebSocketPipelineFilter>() as WebSocketHostBuilder)
-                .UseMiddleware<HandshakeCheckMiddleware>()
+            return Create(args: null);
+        }
+
+        public static WebSocketHostBuilder Create(string[] args)
+        {
+            return Create(new WebSocketHostBuilder(args));
+        }
+
+        public static WebSocketHostBuilder Create(SuperSocketHostBuilder<WebSocketPackage> hostBuilder)
+        {
+            return hostBuilder.UsePipelineFilter<WebSocketPipelineFilter>()
+                .UseWebSocketMiddleware()
                 .ConfigureServices((ctx, services) =>
                 {
                     services.AddSingleton<IPackageHandler<WebSocketPackage>, WebSocketPackageHandler>();
                 }) as WebSocketHostBuilder;
+        }
+
+        public static WebSocketHostBuilder Create(IHostBuilder hostBuilder)
+        {
+            return Create(new WebSocketHostBuilder(hostBuilder));
+        }
+
+        internal static void ValidateHostBuilder(HostBuilderContext builderCtx, IServiceCollection services)
+        {
+            
         }
     }
 }

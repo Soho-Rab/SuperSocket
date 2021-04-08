@@ -1,26 +1,23 @@
 <Project>
   <Import Project="Dependencies.props" />
   <PropertyGroup>
-    <VersionPrefix>2.0.0-beta1</VersionPrefix>    
-    <VersionSuffix>$(VersionSuffix)</VersionSuffix>   
-    <NrtRevisionFormat>$(VersionPrefix)-$(VersionSuffix)-{chash}</NrtRevisionFormat>
-  </PropertyGroup>
-  <PropertyGroup>
-    <LangVersion>8.0</LangVersion>    
+    <LangVersion>8.0</LangVersion>
     <LibTargetFramework>netstandard2.1</LibTargetFramework>
   </PropertyGroup>
-  <PropertyGroup>    
+  <PropertyGroup>
     <PackageProjectUrl>https://github.com/kerryjiang/supersocket</PackageProjectUrl>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <IncludeSource>true</IncludeSource>
-    <Authors>Kerry Jiang</Authors>
+    <Authors>Kerry Jiang and other contributors</Authors>
+    <Owners>Kerry Jiang</Owners>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Unclassified.NetRevisionTask" Version="0.3.0">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />
+  </ItemGroup>
+  <ItemGroup Condition="$(IsPackable) != False AND '$(OutputType)' != 'Exe'">
+    <Compile Include="..\..\InternalsVisibleTo.cs" />
   </ItemGroup>
 </Project>

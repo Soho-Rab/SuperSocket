@@ -17,7 +17,7 @@ namespace SuperSocket.Server
 
         public TcpChannelCreatorFactory(IServiceProvider serviceProvider)
         {
-            _socketOptionsSetter = serviceProvider.GetService<Action<Socket>>();
+            _socketOptionsSetter = serviceProvider.GetService<SocketOptionsSetter>()?.Setter;
         }
 
         protected virtual void ApplySocketOptions(Socket socket, ListenOptions listenOptions, ChannelOptions channelOptions, ILogger logger)
@@ -107,12 +107,13 @@ namespace SuperSocket.Server
                     
                     authOptions.EnabledSslProtocols = options.Security;
                     authOptions.ServerCertificate = options.CertificateOptions.Certificate;
+                    authOptions.ClientCertificateRequired = options.CertificateOptions.ClientCertificateRequired;
 
                     if (options.CertificateOptions.RemoteCertificateValidationCallback != null)
                         authOptions.RemoteCertificateValidationCallback = options.CertificateOptions.RemoteCertificateValidationCallback;
 
                     var stream = new SslStream(new NetworkStream(s, true), false);
-                    await stream.AuthenticateAsServerAsync(authOptions, CancellationToken.None);
+                    await stream.AuthenticateAsServerAsync(authOptions, CancellationToken.None).ConfigureAwait(false);
                     return new StreamPipeChannel<TPackageInfo>(stream, s.RemoteEndPoint, s.LocalEndPoint, filterFactory.Create(s), channelOptions);
                 });
 

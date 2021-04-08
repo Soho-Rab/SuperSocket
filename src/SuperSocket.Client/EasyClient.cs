@@ -1,12 +1,16 @@
 ﻿using System;
-using System.Threading.Tasks;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Security.Authentication;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using SuperSocket.Channel;
 using SuperSocket.ProtoBase;
-using Microsoft.Extensions.Logging;
-using System.Threading;
+
 
 namespace SuperSocket.Client
 {
@@ -59,13 +63,17 @@ namespace SuperSocket.Client
 
         public event PackageHandler<TReceivePackage> PackageHandler;
 
+        public IPEndPoint LocalEndPoint { get; set; }
+
+        public SecurityOptions Security { get; set; }
+
         protected EasyClient()
         {
 
         }
 
         public EasyClient(IPipelineFilter<TReceivePackage> pipelineFilter)
-            : this(pipelineFilter, new ChannelOptions())
+            : this(pipelineFilter, NullLogger.Instance)
         {
             
         }
@@ -94,10 +102,18 @@ namespace SuperSocket.Client
             return this;
         }
 
-        protected virtual IConnector GetConntector()
+        protected virtual IConnector GetConnector()
         {
-            return new SocketConnector();
-        }        
+            var security = Security;
+
+            if (security != null)
+            {
+                if (security.EnabledSslProtocols != SslProtocols.None)
+                    return new SocketConnector(LocalEndPoint, new SslStreamConnector(security));
+            }
+            
+            return new SocketConnector(LocalEndPoint);
+        }
 
         ValueTask<bool> IEasyClient<TReceivePackage>.ConnectAsync(EndPoint remoteEndPoint, CancellationToken cancellationToken)
         {
@@ -106,7 +122,7 @@ namespace SuperSocket.Client
 
         protected virtual async ValueTask<bool> ConnectAsync(EndPoint remoteEndPoint, CancellationToken cancellationToken)
         {
-            var connector = GetConntector();
+            var connector = GetConnector();
             var state = await connector.ConnectAsync(remoteEndPoint, null, cancellationToken);
 
             if (state.Cancelled || cancellationToken.IsCancellationRequested)
@@ -129,6 +145,63 @@ namespace SuperSocket.Client
             var channelOptions = Options;
             SetupChannel(state.CreateChannel<TReceivePackage>(_pipelineFilter, channelOptions));
             return true;
+        }
+
+        public void AsUdp(IPEndPoint remoteEndPoint, ArrayPool<byte> bufferPool = null, int bufferSize = 4096)
+        { 
+            var localEndPoint = LocalEndPoint;
+
+            if (localEndPoint == null)
+            {
+                localEndPoint = new IPEndPoint(remoteEndPoint.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+            }
+
+            var socket = new Socket(remoteEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            
+            // bind the local endpoint
+            socket.Bind(localEndPoint);
+
+            var channel = new UdpPipeChannel<TReceivePackage>(socket, _pipelineFilter, this.Options, remoteEndPoint);
+
+            SetupChannel(channel);
+
+            UdpReceive(socket, channel, bufferPool, bufferSize);
+        }
+
+        private async void UdpReceive(Socket socket, UdpPipeChannel<TReceivePackage> channel, ArrayPool<byte> bufferPool, int bufferSize)
+        {
+            if (bufferPool == null)
+                bufferPool = ArrayPool<byte>.Shared;
+
+            while (true)
+            {
+                var buffer = bufferPool.Rent(bufferSize);
+
+                try
+                {
+                    var result = await socket
+                        .ReceiveFromAsync(new ArraySegment<byte>(buffer, 0, buffer.Length), SocketFlags.None, channel.RemoteEndPoint)
+                        .ConfigureAwait(false);
+
+                    await channel.WritePipeDataAsync((new ArraySegment<byte>(buffer, 0, result.ReceivedBytes)).AsMemory(), CancellationToken.None);
+                }
+                catch (NullReferenceException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception e)
+                {
+                    OnError($"Failed to receive UDP data.", e);
+                }
+                finally
+                {
+                    bufferPool.Return(buffer);
+                }
+            }
         }
 
         protected virtual void SetupChannel(IChannel<TReceivePackage> channel)
@@ -178,17 +251,17 @@ namespace SuperSocket.Client
 
             while (await enumerator.MoveNextAsync())
             {
-                OnPackageReceived(enumerator.Current);
+                await OnPackageReceived(enumerator.Current);
             }
         }
 
-        private void OnPackageReceived(TReceivePackage package)
+        protected virtual async ValueTask OnPackageReceived(TReceivePackage package)
         {
             var handler = PackageHandler;
 
             try
             {
-                handler.Invoke(this, package);
+                await handler.Invoke(this, package);
             }
             catch (Exception e)
             {
@@ -220,6 +293,11 @@ namespace SuperSocket.Client
             Logger?.LogError(exception, message);
         }
 
+        protected virtual void OnError(string message)
+        {
+            Logger?.LogError(message);
+        }
+
         ValueTask IEasyClient<TReceivePackage>.SendAsync(ReadOnlyMemory<byte> data)
         {
             return SendAsync(data);
@@ -244,7 +322,7 @@ namespace SuperSocket.Client
 
         public virtual async ValueTask CloseAsync()
         {
-            await Channel.CloseAsync();
+            await Channel.CloseAsync(CloseReason.LocalClosing);
             OnClosed(this, EventArgs.Empty);
         }
     }

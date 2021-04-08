@@ -13,19 +13,24 @@ namespace SuperSocket.Server
 {
     public class MultipleServerHostBuilder : HostBuilderAdapter<MultipleServerHostBuilder>
     {
-        private bool _appConfigSet = false;
-
         private List<IServerHostBuilderAdapter> _hostBuilderAdapters = new List<IServerHostBuilderAdapter>();
 
         private MultipleServerHostBuilder()
+            : this(args: null)
         {
 
         }
 
-        public override MultipleServerHostBuilder ConfigureAppConfiguration(Action<HostBuilderContext,IConfigurationBuilder> configDelegate)
+        private MultipleServerHostBuilder(string[] args)
+            : base(args)
         {
-            _appConfigSet = true;
-            return base.ConfigureAppConfiguration(configDelegate);
+
+        }
+
+        internal MultipleServerHostBuilder(IHostBuilder hostBuilder)
+            : base(hostBuilder)
+        {
+
         }
 
         protected virtual void ConfigureServers(HostBuilderContext context, IServiceCollection hostServices)
@@ -38,9 +43,6 @@ namespace SuperSocket.Server
 
         public override IHost Build()
         {
-            if (!_appConfigSet)
-                this.ConfigureAppConfiguration(SuperSocketHostBuilder.ConfigureAppConfiguration);
-
             this.ConfigureServices(ConfigureServers);
 
             var host = base.Build();
@@ -56,14 +58,26 @@ namespace SuperSocket.Server
 
         public static MultipleServerHostBuilder Create()
         {
-            return new MultipleServerHostBuilder();
+            return Create(args: null);
+        }
+
+        public static MultipleServerHostBuilder Create(string[] args)
+        {
+            return new MultipleServerHostBuilder(args);
+        }
+
+        private ServerHostBuilderAdapter<TReceivePackage> CreateServerHostBuilder<TReceivePackage>(Action<SuperSocketHostBuilder<TReceivePackage>> hostBuilderDelegate)
+            where TReceivePackage : class
+        {
+            var hostBuilder = new ServerHostBuilderAdapter<TReceivePackage>(this);            
+            hostBuilderDelegate(hostBuilder);
+            return hostBuilder;
         }
 
         public MultipleServerHostBuilder AddServer<TReceivePackage>(Action<SuperSocketHostBuilder<TReceivePackage>> hostBuilderDelegate)
             where TReceivePackage : class
         {
-            var hostBuilder = new ServerHostBuilderAdapter<TReceivePackage>(this);            
-            hostBuilderDelegate(hostBuilder);
+            var hostBuilder = CreateServerHostBuilder<TReceivePackage>(hostBuilderDelegate);
             _hostBuilderAdapters.Add(hostBuilder);
             return this;
         }
@@ -71,11 +85,31 @@ namespace SuperSocket.Server
         public MultipleServerHostBuilder AddServer<TReceivePackage, TPipelineFilter>(Action<SuperSocketHostBuilder<TReceivePackage>> hostBuilderDelegate)
             where TReceivePackage : class
             where TPipelineFilter : IPipelineFilter<TReceivePackage>, new()
+        {            
+            var hostBuilder = CreateServerHostBuilder<TReceivePackage>(hostBuilderDelegate);
+            _hostBuilderAdapters.Add(hostBuilder);
+            hostBuilder.UsePipelineFilter<TPipelineFilter>();
+            return this;
+        }
+
+        public MultipleServerHostBuilder AddServer(IServerHostBuilderAdapter hostBuilderAdapter)
+        {            
+            _hostBuilderAdapters.Add(hostBuilderAdapter);
+            return this;
+        }
+
+        public MultipleServerHostBuilder AddServer<TSuperSocketService, TReceivePackage, TPipelineFilter>(Action<SuperSocketHostBuilder<TReceivePackage>> hostBuilderDelegate)
+            where TReceivePackage : class
+            where TPipelineFilter : IPipelineFilter<TReceivePackage>, new()
+            where TSuperSocketService : SuperSocketService<TReceivePackage>
         {
-            var hostBuilder = new ServerHostBuilderAdapter<TReceivePackage>(this)
-                .UsePipelineFilter<TPipelineFilter>();
-            hostBuilderDelegate(hostBuilder);
-            _hostBuilderAdapters.Add(hostBuilder as IServerHostBuilderAdapter);
+            var hostBuilder = CreateServerHostBuilder<TReceivePackage>(hostBuilderDelegate);
+
+            _hostBuilderAdapters.Add(hostBuilder);
+
+            hostBuilder
+                .UsePipelineFilter<TPipelineFilter>()
+                .UseHostedService<TSuperSocketService>();
             return this;
         }
     }
